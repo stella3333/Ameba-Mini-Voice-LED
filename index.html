@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ameba Mini 語音控制 LED</title>
+  <style>
+    :root { font-family: system-ui, "Noto Sans TC", sans-serif; color: #18302b; }
+    body { max-width: 760px; margin: 0 auto; padding: 24px; background: #f3f7f5; }
+    .panel { background: white; border: 1px solid #c9d9d2; border-radius: 10px; padding: 20px; margin: 16px 0; }
+    button { border: 0; border-radius: 7px; padding: 11px 16px; margin: 4px; background: #176b5b; color: white; font-size: 1rem; cursor: pointer; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.secondary { background: #536b65; }
+    .hint { color: #526861; }
+    .leds { display: flex; gap: 24px; margin-top: 16px; }
+    .led { display: flex; align-items: center; gap: 8px; }
+    .lamp { width: 22px; height: 22px; border-radius: 50%; background: #d5dfdc; border: 1px solid #9cb2aa; }
+    .lamp.on.blue { background: #1689e8; box-shadow: 0 0 14px #1689e8; }
+    .lamp.on.green { background: #22a447; box-shadow: 0 0 14px #22a447; }
+    #log { min-height: 100px; white-space: pre-wrap; background: #102522; color: #d6f5e8; padding: 12px; border-radius: 7px; }
+  </style>
+</head>
+<body>
+  <h1>Ameba Mini 語音控制 LED</h1>
+  <p class="hint">請使用 Chrome 或 Edge，先接上 USB，再允許麥克風。</p>
+  <section class="panel">
+    <button id="connect">連接 Ameba Mini</button>
+    <button id="listen" disabled>開始聆聽</button>
+    <button id="stop" class="secondary" disabled>停止聆聽</button>
+    <label>語音：<select id="language"><option value="zh-TW">中文</option><option value="en-US">English</option></select></label>
+    <p>連線：<span id="connection">未連線</span></p>
+    <p>辨識結果：<strong id="recognized">尚未辨識</strong></p>
+    <p>訊息：<span id="status">請先連接開發板</span></p>
+    <div class="leds">
+      <div class="led"><span id="blueLamp" class="lamp"></span>藍燈（左）</div>
+      <div class="led"><span id="greenLamp" class="lamp"></span>綠燈（右）</div>
+    </div>
+  </section>
+  <section class="panel"><strong>事件紀錄</strong><div id="log" aria-live="polite"></div></section>
+
+  <script>
+    const connectButton = document.querySelector('#connect');
+    const listenButton = document.querySelector('#listen');
+    const stopButton = document.querySelector('#stop');
+    const languageSelect = document.querySelector('#language');
+    const connection = document.querySelector('#connection');
+    const recognized = document.querySelector('#recognized');
+    const status = document.querySelector('#status');
+    const log = document.querySelector('#log');
+    const blueLamp = document.querySelector('#blueLamp');
+    const greenLamp = document.querySelector('#greenLamp');
+    let port;
+    let writer;
+    let reader;
+    let receiveBuffer = '';
+    let recognition;
+    let waitingForState;
+    let connected = false;
+    let simulatedDisconnect = false;
+
+    function addLog(message) {
+      log.textContent = `${new Date().toLocaleTimeString()} ${message}\n${log.textContent}`;
+    }
+
+    function setState(blue, green) {
+      blueLamp.className = `lamp ${blue ? 'on blue' : ''}`;
+      greenLamp.className = `lamp ${green ? 'on green' : ''}`;
+    }
+
+    function markDisconnected(reason) {
+      if (!connected && connection.textContent === '通訊中斷') return;
+      connected = false;
+      simulatedDisconnect = false;
+      writer = undefined;
+      connection.textContent = '通訊中斷';
+      listenButton.disabled = false;
+      connectButton.disabled = false;
+      status.textContent = '通訊中斷，語音指令不會執行';
+      if (waitingForState) { clearTimeout(waitingForState); waitingForState = undefined; }
+      addLog(`通訊中斷：${reason}`);
+    }
+
+    function parseBoardLine(line) {
+      addLog(`開發板回覆：${line}`);
+      if (simulatedDisconnect) {
+        addLog(`模擬中斷期間忽略回覆：${line}`);
+        return;
+      }
+      if (line.startsWith('STATE ')) {
+        const blue = line.includes('BLUE=ON');
+        const green = line.includes('GREEN=ON');
+        setState(blue, green);
+        status.textContent = `開發板回報：藍燈 ${blue ? '開' : '關'}、綠燈 ${green ? '開' : '關'}`;
+        if (waitingForState) { clearTimeout(waitingForState); waitingForState = undefined; }
+      } else if (line.startsWith('READY')) {
+        addLog('開發板已就緒');
+      } else if (line.startsWith('ERROR')) {
+        status.textContent = `開發板錯誤：${line}`;
+        addLog(line);
+      }
+    }
+
+    async function readSerial() {
+      const decoder = new TextDecoder();
+      try {
+        while (port.readable) {
+          reader = port.readable.getReader();
+          try {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              receiveBuffer += decoder.decode(value, { stream: true });
+              const lines = receiveBuffer.split(/\r?\n/);
+              receiveBuffer = lines.pop();
+              lines.filter(Boolean).forEach(parseBoardLine);
+            }
+          } finally { reader.releaseLock(); }
+        }
+      } catch (error) {
+        addLog(`讀取失敗：${error.message}`);
+        markDisconnected(error.message);
+      }
+    }
+
+    async function sendCommand(command) {
+      if (!connected || !writer) {
+        status.textContent = '通訊中斷，指令未執行';
+        addLog(`未執行 ${command}：通訊中斷`);
+        return false;
+      }
+      try {
+        await writer.write(new TextEncoder().encode(`${command}\n`));
+        addLog(`送出 ${command}`);
+        waitingForState = setTimeout(() => {
+          status.textContent = '通訊逾時：未收到開發板 STATE 回報';
+          addLog('通訊失敗或開發板未回覆');
+        }, 3000);
+        return true;
+      } catch (error) {
+        markDisconnected(error.message);
+        addLog(`送出失敗：${error.message}`);
+        return false;
+      }
+    }
+
+    function commandFromSpeech(text) {
+      const normalized = text.replace(/[，。！!？?、\s]/g, '');
+      if (/(左邊|左側|左)(關燈|熄燈)|(關掉|熄掉)(左邊|左側|左)燈/.test(normalized)) return 'LEFT_OFF';
+      if (/(右邊|右側|右)(關燈|熄燈)|(關掉|熄掉)(右邊|右側|右)燈/.test(normalized)) return 'RIGHT_OFF';
+      if (/(左邊|左側|左)開燈/.test(normalized)) return 'LEFT_ON';
+      if (/(右邊|右側|右)開燈/.test(normalized)) return 'RIGHT_ON';
+      if (/(閃爍|閃|闪烁)(三|3)次/.test(normalized)) return 'BLINK_THREE';
+      const english = text.toLowerCase().replace(/[,.!?\s]/g, '');
+      if (english.includes('leftoff') || english.includes('turnofftheleft')) return 'LEFT_OFF';
+      if (english.includes('rightoff') || english.includes('turnofftheright')) return 'RIGHT_OFF';
+      if (english.includes('lefton') || english.includes('turnontheleft')) return 'LEFT_ON';
+      if (english.includes('righton') || english.includes('turnontheright')) return 'RIGHT_ON';
+      if (english === 'blink') return 'BLINK_THREE';
+      return undefined;
+    }
+
+    function handleCommunicationVoiceCommand(text) {
+      const normalized = text.replace(/[，。！!？?、\s]/g, '');
+      const english = text.toLowerCase().replace(/[,.!?\s]/g, '');
+      if (/(通訊|通信|通讯)(中斷|中断)/.test(normalized) || english === 'communicationinterrupted') {
+        if (!connected) {
+          status.textContent = '目前已中斷，燈控語音不會執行';
+          addLog('通訊中斷測試：目前已是中斷狀態');
+          return true;
+        }
+        connected = false;
+        simulatedDisconnect = true;
+        connection.textContent = '模擬通訊中斷';
+        status.textContent = '已模擬通訊中斷，燈控指令不會送出';
+        addLog('語音測試：已模擬通訊中斷');
+        return true;
+      }
+      return false;
+    }
+
+    connectButton.onclick = async () => {
+      if (!('serial' in navigator)) { status.textContent = '請改用 Chrome 或 Edge'; return; }
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        writer = port.writable.getWriter();
+        connected = true;
+        navigator.serial.addEventListener('disconnect', event => {
+          if (event.target === port || event.port === port) markDisconnected('USB 裝置已移除');
+        });
+        connection.textContent = '已連線';
+        status.textContent = '已連線，等待開發板回報';
+        listenButton.disabled = false; connectButton.disabled = true;
+        readSerial();
+        await sendCommand('STATUS');
+      } catch (error) {
+        connected = false;
+        status.textContent = `連線失敗：${error.message}`;
+        addLog(`連線失敗：${error.message}`);
+      }
+    };
+
+    listenButton.onclick = () => recognition ? recognition.start() : (status.textContent = '請改用支援語音辨識的 Chrome 或 Edge');
+    stopButton.onclick = () => recognition?.stop();
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      recognition = new SpeechRecognition();
+      recognition.lang = languageSelect.value;
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      recognition.onstart = () => { status.textContent = '聆聽中，請說「左邊開燈」或「右邊開燈」'; listenButton.disabled = true; stopButton.disabled = false; };
+      recognition.onresult = async event => {
+        const text = event.results[0][0].transcript;
+        recognized.textContent = text;
+        if (handleCommunicationVoiceCommand(text)) return;
+        const command = commandFromSpeech(text);
+        if (!command) { status.textContent = '非控制指令，LED 狀態未變更'; addLog(`忽略非控制語句：${text}`); return; }
+        if (!connected) {
+          status.textContent = '通訊中斷，指令未執行';
+          addLog(`辨識到 ${command}，但通訊中斷，未執行`);
+          return;
+        }
+        status.textContent = '辨識到控制指令，等待開發板回報';
+        await sendCommand(command);
+      };
+      recognition.onerror = event => { status.textContent = `語音辨識失敗：${event.error}`; addLog(`辨識失敗：${event.error}`); };
+      recognition.onend = () => { listenButton.disabled = false; stopButton.disabled = true; };
+      languageSelect.onchange = () => { recognition.lang = languageSelect.value; };
+    }
+  </script>
+</body>
+</html>
